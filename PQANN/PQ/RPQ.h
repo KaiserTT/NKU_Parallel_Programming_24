@@ -26,11 +26,13 @@ public:
 
     SiftData<float> calc_residuals(const SiftData<float>& siftData, const PQ_Index& index, const PQ_Codebooks& codebooks);
 
+    SiftData<float> calc_residuals_pthread(const SiftData<float>& siftData, const PQ_Index& index, const PQ_Codebooks& codebooks, int thread_num);
+
+    SiftData<float> calc_residuals_openmp(const SiftData<float> &siftData, const PQ_Index &index, const PQ_Codebooks &codebooks, int thread_num);
+
     std::vector<float> calc_datapoint_residuals(const std::vector<float>& datapoint0, const std::vector<float>& datapoint1);
 
-    std::vector<float> RPQ::calc_datapoint_residuals_avx2(const std::vector<float> &datapoint0, const std::vector<float> &datapoint1);
-
-    std::vector<float> calc_datapoint_residuals_unroll(const std::vector<float>& datapoint0, const std::vector<float>& datapoint1);
+    std::vector<float> calc_datapoint_residuals_avx2(const std::vector<float> &datapoint0, const std::vector<float> &datapoint1);
 
     unsigned int asymmetric_query(const std::vector<float>& querypoint);
 
@@ -41,6 +43,10 @@ public:
     void save_index(const std::string& filename);
 
     void read_index(const std::string& filename);
+
+    int get_subspace_num() {
+        return pq.get_subspace_num();
+    }
 
 private:
     PQ pq;

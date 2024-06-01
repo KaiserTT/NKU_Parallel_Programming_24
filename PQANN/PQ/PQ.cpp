@@ -9,6 +9,96 @@
 #include <fstream>
 #include <limits>
 #include <windows.h>
+#include <pthread.h>
+#include <omp.h>
+
+
+struct Quantize_Thread_Data {
+    const std::vector<float> *datapoint;
+    PQ_Codebooks *codebooks;
+    std::vector<int> *codes;
+    int subspace_idx;
+    unsigned int subspace_dim;
+    int centroid_num;
+};
+
+void* quantize_subspace(void* arg) {
+    Quantize_Thread_Data *data = static_cast<Quantize_Thread_Data*>(arg);
+    int subspace_idx = data->subspace_idx;
+    unsigned int subspace_dim = data->subspace_dim;
+    const std::vector<float> &datapoint = *data->datapoint;
+    PQ_Codebooks &codebooks = *data->codebooks;
+    std::vector<int> &codes = *data->codes;
+    int centroid_num = data->centroid_num;
+
+    double min_dist = std::numeric_limits<double>::max();
+    int best_idx = -1;
+    std::vector<float> subdatapoint(subspace_dim);
+    for (int j = 0; j < centroid_num; j++) {
+        for (unsigned int k = 0; k < subspace_dim; k++) {
+            subdatapoint[k] = datapoint[subspace_idx * subspace_dim + k];
+        }
+        double dist = distance(subdatapoint, codebooks[subspace_idx][j]);
+        if (dist < min_dist) {
+            min_dist = dist;
+            best_idx = j;
+        }
+    }
+    codes[subspace_idx] = best_idx;
+    pthread_exit(NULL);
+}
+
+std::vector<int> PQ::quantize_pthread(const std::vector<float> &datapoint) {
+    unsigned int subspace_dim = datapoint.size() / subspace_num;
+    std::vector<int> codes(subspace_num);
+    pthread_t threads[subspace_num];
+    Quantize_Thread_Data thread_data[subspace_num];
+
+    for (unsigned int i = 0; i < subspace_num; i++) {
+        thread_data[i].datapoint = &datapoint;
+        thread_data[i].codebooks = &this->codebooks;
+        thread_data[i].codes = &codes;
+        thread_data[i].subspace_idx = i;
+        thread_data[i].subspace_dim = subspace_dim;
+        thread_data[i].centroid_num = centroid_num;
+
+        pthread_create(&threads[i], NULL, quantize_subspace, (void*)&thread_data[i]);
+    }
+
+    for (unsigned int i = 0; i < subspace_num; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    return codes;
+}
+
+std::vector<int> PQ::quantize_openmp(const std::vector<float>& datapoint) {
+    unsigned int subspace_dim = datapoint.size() / subspace_num;
+    std::vector<int> codes(subspace_num);
+
+    omp_set_num_threads(4);
+
+    #pragma omp parallel for
+    for (int i = 0; i < subspace_num; i++) {
+        double min_dist = std::numeric_limits<double>::max();
+        int best_idx = -1;
+        std::vector<float> subdatapoint(subspace_dim);
+
+        for (int j = 0; j < centroid_num; j++) {
+            for (unsigned int k = 0; k < subspace_dim; k++) {
+                subdatapoint[k] = datapoint[i * subspace_dim + k];
+            }
+            double dist = distance(subdatapoint, codebooks[i][j]);
+            if (dist < min_dist) {
+                min_dist = dist;
+                best_idx = j;
+            }
+        }
+        codes[i] = best_idx;
+    }
+
+    return codes;
+}
 
 
 std::vector<int> PQ::quantize(const std::vector<float> &datapoint) {
@@ -23,7 +113,7 @@ std::vector<int> PQ::quantize(const std::vector<float> &datapoint) {
             for (int k = 0; k < subspace_dim; k++) {
                 subdatapoint[k] = datapoint[i * subspace_dim + k];
             }
-            double dist = distance_unroll(subdatapoint, this->codebooks[i][j]);
+            double dist = distance(subdatapoint, this->codebooks[i][j]);
             if (dist < min_dist) {
                 min_dist = dist;
                 best_idx = j;
@@ -33,6 +123,9 @@ std::vector<int> PQ::quantize(const std::vector<float> &datapoint) {
     }
     return codes;
 }
+
+
+
 
 int PQ::asymmetric_query(const std::vector<float> &querypoint) {
     unsigned int subspace_dim = querypoint.size() / subspace_num;
@@ -47,7 +140,7 @@ int PQ::asymmetric_query(const std::vector<float> &querypoint) {
             for (int k = 0; k < subspace_dim; k++) {
                 subquerypoint[k] = querypoint[j * subspace_dim + k];
             }
-            dist += distance_unroll(subquerypoint, codebooks[j][index[i][j]]);
+            dist += avx2_distance(subquerypoint, codebooks[j][index[i][j]]);
         }
         if (dist < min_dist) {
             min_dist = dist;
@@ -146,7 +239,7 @@ PQ_Index PQ::buildIndex(const SiftData<float> &data) {
     QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
     QueryPerformanceCounter((LARGE_INTEGER*)&head);
     for (int i = 0; i < data.get_num(); i++) {
-        index[i] = quantize(data.data[i]);
+        index[i] = quantize_openmp(data.data[i]);
         if (i % 100000 == 0)
             std::cout << "quantized " << i << " datapoint." << std::endl;
     }
@@ -206,6 +299,58 @@ void PQ::read_index(const std::string &filename) {
     std::cout << "Index read. " << "index: (" << index.size() << ", " << index[0].size() << ")" << std::endl;
 }
 
+struct query_ThreadData {
+    const SiftData<float>* all_data;
+    PQ* pq_instance;
+    std::vector<int>* result;
+    size_t start_index;
+    size_t end_index;
+};
+
+void* thread_query(void* arg) {
+    query_ThreadData* data = static_cast<query_ThreadData*>(arg);
+    for (size_t i = data->start_index; i < data->end_index; i++) {
+        (*data->result)[i] = data->pq_instance->asymmetric_query(data->all_data->data[i]);
+    }
+    return nullptr;
+}
+
+std::vector<int> PQ::query_thread(const SiftData<float> &querydata, int thread_num) {
+    size_t num_threads = thread_num;  // Or any other appropriate number
+    std::vector<int> result(querydata.get_num());
+    pthread_t threads[num_threads];
+    query_ThreadData threadData[num_threads];
+
+    size_t part = querydata.get_num() / num_threads;
+    for (size_t i = 0; i < num_threads; i++) {
+        threadData[i].pq_instance = this;
+        threadData[i].all_data = &querydata;
+        threadData[i].result = &result;
+        threadData[i].start_index = i * part;
+        threadData[i].end_index = (i + 1) == num_threads ? querydata.get_num() : (i + 1) * part;
+        pthread_create(&threads[i], nullptr, thread_query, &threadData[i]);
+    }
+    for (auto &thread : threads) {
+        pthread_join(thread, nullptr);
+    }
+
+    return result;
+}
+
+std::vector<int> PQ::query_openmp(const SiftData<float> &querydata, int thread_num) {
+
+    std::vector<int> result(querydata.get_num());
+
+    omp_set_num_threads(thread_num);
+
+    #pragma omp parallel for
+    for (size_t i = 0; i < querydata.get_num(); i++) {
+        result[i] = asymmetric_query(querydata.data[i]);
+    }
+
+    return result;
+}
+
 std::vector<int> PQ::query(const SiftData<float> &querydata) {
     long long freq, head, tail;
     QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
@@ -242,5 +387,62 @@ int PQ::symmetric_query(const std::vector<float> &querypoint) {
 }
 
 
+struct buildIndex_ThreadData {
+    const SiftData<float>* all_data;
+    PQ* pq_instance;
+    unsigned int start_index;
+    unsigned int end_index;
+    PQ_Index* partial_index;
+};
 
+void* quantize_data(void* arg) {
+    buildIndex_ThreadData* data = static_cast<buildIndex_ThreadData*>(arg);
 
+    std::vector<std::vector<int>>& part_index = *(data->partial_index);
+    for (unsigned int i = data->start_index; i < data->end_index; ++i) {
+        part_index[i] = data->pq_instance->quantize_pthread(data->all_data->data[i]);
+    }
+    pthread_exit(NULL);
+}
+
+PQ_Index PQ::buildIndex_pthread(const SiftData<float>& data, int thread_num) {
+    unsigned int num_threads = thread_num;  // 可调整线程数量
+    unsigned int num_vectors = data.get_num();
+    unsigned int vectors_per_thread = num_vectors / num_threads;
+
+    pthread_t threads[num_threads];
+    buildIndex_ThreadData thread_data[num_threads];
+    PQ_Index index(num_vectors, std::vector<int>());  // 初始化最终的索引
+
+    for (unsigned int i = 0; i < num_threads; ++i) {
+        thread_data[i].all_data = &data;
+        thread_data[i].pq_instance = this;
+        thread_data[i].start_index = i * vectors_per_thread;
+        thread_data[i].end_index = (i == num_threads - 1) ? num_vectors : (i + 1) * vectors_per_thread;
+        thread_data[i].partial_index = &index;
+
+        pthread_create(&threads[i], NULL, quantize_data, (void*)&thread_data[i]);
+    }
+
+    for (unsigned int i = 0; i < num_threads; ++i) {
+        pthread_join(threads[i], NULL);
+    }
+    this->index = index;
+    return index;
+}
+
+PQ_Index PQ::buildIndex_openmp(const SiftData<float>& data, int thread_num) {
+    int num_vectors = data.get_num();
+    PQ_Index index(num_vectors, std::vector<int>(subspace_num));
+
+    // 设置线程数
+    omp_set_num_threads(thread_num);  // 你可以根据需要调整这个数字
+
+    // OpenMP 并行循环
+    #pragma omp parallel for
+    for (int i = 0; i < num_vectors; i++) {
+        index[i] = quantize_openmp(data.data[i]);
+    }
+
+    return index;
+}
