@@ -8,6 +8,7 @@
 #include <immintrin.h>
 #include <pthread.h>
 #include <omp.h>
+#include <mpi.h>
 
 void RPQ::train(const SiftData<float> &siftData) {
     PQ_Codebooks codebooks0 = pq.train(siftData);
@@ -66,6 +67,66 @@ SiftData<float> RPQ::calc_residuals(const SiftData<float> &siftData, const PQ_In
         }
     }
     return residuals;
+}
+
+SiftData<float> RPQ::calc_residuals_mpi(const SiftData<float> &siftData, const PQ_Index &index, const PQ_Codebooks &codebooks) {
+    MPI_Init(nullptr, nullptr);
+
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    unsigned int subspace_dim = siftData.get_dim() / pq.get_subspace_num();
+    unsigned int subspace_num = pq.get_subspace_num();
+    unsigned int num_data_points = siftData.get_num();
+    unsigned int dim = siftData.get_dim();
+
+    // 计算每个进程处理的数据大小
+    unsigned int local_size = num_data_points / size;
+    unsigned int start_index = rank * local_size;
+    unsigned int end_index = (rank == size - 1) ? num_data_points : (rank + 1) * local_size;
+
+    // 初始化局部残差结果
+    std::vector<float> local_residuals(local_size * dim);
+
+    // 计算本地残差
+    for (unsigned int i = start_index; i < end_index; i++) {
+        for (unsigned int j = 0; j < subspace_num; j++) {
+            std::vector<float> subdatapoint(subspace_dim);
+            for (unsigned int k = 0; k < subspace_dim; k++) {
+                subdatapoint[k] = siftData.data[i][j * subspace_dim + k];
+            }
+            std::vector<float> residual = calc_datapoint_residuals_avx2(subdatapoint, codebooks[j][index[i][j]]);
+            for (unsigned int k = 0; k < subspace_dim; k++) {
+                local_residuals[(i - start_index) * dim + j * subspace_dim + k] = residual[k];
+            }
+        }
+    }
+
+    // 初始化全局残差结果
+    std::vector<float> global_residuals;
+    if (rank == 0) {
+        global_residuals.resize(num_data_points * dim);
+    }
+
+    // 使用 MPI_Gather 收集所有进程的局部残差结果到全局残差结果
+    MPI_Gather(local_residuals.data(), local_size * dim, MPI_FLOAT,
+               global_residuals.data(), local_size * dim, MPI_FLOAT,
+               0, MPI_COMM_WORLD);
+
+    MPI_Finalize();
+
+    if (rank == 0) {
+        SiftData<float> residuals(num_data_points, dim);
+        for (unsigned int i = 0; i < num_data_points; i++) {
+            for (unsigned int j = 0; j < dim; j++) {
+                residuals.data[i][j] = global_residuals[i * dim + j];
+            }
+        }
+        return residuals;
+    } else {
+        return SiftData<float>(); // 返回空对象
+    }
 }
 
 struct ThreadData {
@@ -315,4 +376,130 @@ std::vector<float> RPQ::calc_datapoint_residuals_avx2(const std::vector<float> &
     }
 
     return residual;
+}
+
+
+struct ResThreadData {
+    RPQ* rpq;
+    const std::vector<float>* querypoint;
+    const RPQ_Index* index;
+    const RPQ_Codebooks* codebooks;
+    int start_idx, end_idx;
+    unsigned int local_best_idx;
+    double local_min_dist;
+};
+
+pthread_mutex_t mutex;
+unsigned int best_idx;
+double min_dist;
+
+void* thread_func(void* arg) {
+    ResThreadData* data = (ResThreadData*)arg;
+    data->local_best_idx = -1;
+    data->local_min_dist = std::numeric_limits<double>::max();
+
+    int subspace_num = data->rpq->get_subspace_num();
+    int subspace_dim = data->querypoint->size() / subspace_num;
+
+    for (int i = data->start_idx; i < data->end_idx; i++) {
+        double dist = 0.0;
+        for (int layer = 0; layer < 3; layer++)
+
+
+for (int sub = 0; sub < subspace_num; sub++) {
+            std::vector<float> subquerypoint(subspace_dim);
+            for (int k = 0; k < subspace_dim; k++) {
+                subquerypoint[k] = (*data->querypoint)[sub * subspace_dim + k];
+            }
+            int centroid = (*data->index)[layer][i][sub];
+            dist += distance_unroll(subquerypoint, (*data->codebooks)[layer][sub][centroid]);
+        }
+        if (dist < data->local_min_dist) {
+            data->local_min_dist = dist;
+            data->local_best_idx = i;
+        }
+    }
+
+    pthread_mutex_lock(&mutex);
+    if (data->local_min_dist < min_dist) {
+        min_dist = data->local_min_dist;
+        best_idx = data->local_best_idx;
+    }
+    pthread_mutex_unlock(&mutex);
+
+    pthread_exit(NULL);
+}
+
+unsigned int RPQ::asymmetric_query_pthread(const std::vector<float>& querypoint, int num_threads) {
+    best_idx = -1;
+    min_dist = std::numeric_limits<double>::max();
+    int subspace_dim = querypoint.size() / get_subspace_num();
+
+    pthread_mutex_init(&mutex, NULL);
+    std::vector<pthread_t> threads(num_threads);
+    std::vector<ResThreadData> thread_data(num_threads);
+
+    int points_per_thread = this->index[0].size() / num_threads;
+
+    for (int t = 0; t < num_threads; t++) {
+        thread_data[t] = {this, &querypoint, &this->index, &this->codebooks, t * points_per_thread, (t + 1) * points_per_thread};
+        if (t == num_threads - 1) {
+            thread_data[t].end_idx = this->index[0].size();
+        }
+        pthread_create(&threads[t], NULL, thread_func, (void*)&thread_data[t]);
+    }
+
+    for (int t = 0; t < num_threads; t++) {
+        pthread_join(threads[t], NULL);
+    }
+
+    pthread_mutex_destroy(&mutex);
+
+    std::cout << "asymmetric query finished. best_idx: " << best_idx << " distance=" << min_dist << std::endl;
+    std::cout << "======================================" << std::endl;
+
+    return best_idx;
+}
+
+unsigned int RPQ::asymmetric_query_openmp(const std::vector<float> &querypoint) {
+    unsigned int best_idx = -1;
+    double min_dist = (std::numeric_limits<double>::max)();
+    unsigned int subspace_dim = querypoint.size() / pq.get_subspace_num();
+
+    #pragma omp parallel
+    {
+        unsigned int local_best_idx = -1;
+        double local_min_dist = (std::numeric_limits<double>::max)();
+
+        #pragma omp for
+        for (int i = 0; i < this->index[0].size(); i++) {
+            double dist = 0.0;
+            for (int layer = 0; layer < this->layers; layer++) {
+                for (int sub = 0; sub < pq.get_subspace_num(); sub++) {
+                    std::vector<float> subquerypoint(subspace_dim);
+                    for (int k = 0; k < subspace_dim; k++) {
+                        subquerypoint[k] = querypoint[sub * subspace_dim + k];
+                    }
+                    int centroid = index[layer][i][sub];
+                    dist += distance_unroll(subquerypoint, codebooks[layer][sub][centroid]);
+                }
+            }
+            if (dist < local_min_dist) {
+                local_min_dist = dist;
+                local_best_idx = i;
+            }
+        }
+
+        #pragma omp critical
+        {
+            if (local_min_dist < min_dist) {
+                min_dist = local_min_dist;
+                best_idx = local_best_idx;
+            }
+        }
+    }
+
+    std::cout << "asymmetric query finished. best_idx: " << best_idx << " distance=" << min_dist << std::endl;
+    std::cout << "======================================" << std::endl;
+    return best_idx;
 }

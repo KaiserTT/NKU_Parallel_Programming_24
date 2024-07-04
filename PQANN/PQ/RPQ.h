@@ -30,6 +30,12 @@ public:
 
     SiftData<float> calc_residuals_openmp(const SiftData<float> &siftData, const PQ_Index &index, const PQ_Codebooks &codebooks, int thread_num);
 
+    SiftData<float> calc_residuals_mpi(const SiftData<float> &siftData, const PQ_Index &index, const PQ_Codebooks &codebooks);
+
+    unsigned int asymmetric_query_pthread(const std::vector<float>& querypoint, int num_threads);
+
+    unsigned int asymmetric_query_openmp(const std::vector<float> &querypoint);
+
     std::vector<float> calc_datapoint_residuals(const std::vector<float>& datapoint0, const std::vector<float>& datapoint1);
 
     std::vector<float> calc_datapoint_residuals_avx2(const std::vector<float> &datapoint0, const std::vector<float> &datapoint1);

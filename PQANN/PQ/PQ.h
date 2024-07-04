@@ -1,10 +1,6 @@
 //
 // Created by Kaiser Tan on 2024/4/21.
 //
-
-#ifndef PQANN_PQ_H
-#define PQANN_PQ_H
-
 #include <vector>
 #include <omp.h>
 #include "../SiftData/SiftData.h"
@@ -37,6 +33,8 @@ public:
 
     PQ_Index buildIndex_openmp(const SiftData<float>& data, int thread_num);
 
+    PQ_Index buildIndexMPI(const SiftData<float>& data);
+
     int asymmetric_query(const std::vector<float>& querypoint);
 
     int symmetric_query(const std::vector<float>& querypoint);
@@ -46,6 +44,8 @@ public:
     std::vector<int> query_openmp(const SiftData<float> &querydata, int thread_num);
 
     std::vector<int> query_thread(const SiftData<float> &querydata, int thread_num);
+
+    std::vector<int> query_mpi(const SiftData<float> &querydata);
 
     void save_codebooks(const std::string& filename);
 
@@ -79,6 +79,3 @@ private:
     unsigned int subspace_num;
     unsigned int centroid_num;
 };
-
-
-#endif //PQANN_PQ_H

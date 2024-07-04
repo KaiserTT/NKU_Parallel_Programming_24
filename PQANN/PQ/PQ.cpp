@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <pthread.h>
 #include <omp.h>
+#include <mpi.h>
 
 
 struct Quantize_Thread_Data {
@@ -164,8 +165,8 @@ PQ_Codebooks PQ::train(const SiftData<float> &data) {
         long long freq, head, tail;
         QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
         QueryPerformanceCounter((LARGE_INTEGER*)&head);
-        KMEANS kmeans(centroid_num, 200);
-        codebooks[i] = kmeans.fit(subdata);
+        KMEANS kmeans(centroid_num, 1);
+        codebooks[i] = kmeans.fit_openmp(subdata, 20);
         QueryPerformanceCounter((LARGE_INTEGER*)&tail);
         std::cout << "subspace " << i << " trained time " << (tail - head) * 1000.0 / freq << "ms" << std::endl;
         std::cout << "subspace " << i << " trained. " << "codebooks: (" << codebooks[i].size() << ", " << codebooks[i][0].size() << ")" << std::endl;
@@ -249,6 +250,44 @@ PQ_Index PQ::buildIndex(const SiftData<float> &data) {
     std::cout << "Index built. " << "index: (" << index.size() << ", " << index[0].size() << ")" << std::endl;
 
     return this->index;
+}
+
+PQ_Index PQ::buildIndexMPI(const SiftData<float>& data)
+{
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int num_vectors = data.get_num();
+    int local_size = num_vectors / size;
+    int start_index = rank * local_size;
+    int end_index = (rank == size - 1) ? num_vectors : start_index + local_size;  // 处理最后一个进程的边界情况
+
+    std::cout << "Process " << rank << " is processing from index " << start_index << " to " << end_index << std::endl;
+
+    PQ_Index local_index(local_size, std::vector<int>(subspace_num));
+    for (int i = start_index; i < end_index; ++i) {
+        local_index[i - start_index] = quantize_openmp(data.data[i]);
+        if ((i - start_index) % 10000 == 0) {
+            std::cout << "Process " << rank << " processed " << i - start_index << " items." << std::endl;
+        }
+    }
+
+    std::vector<std::vector<int>> all_indices;
+    if (rank == 0) {
+        all_indices.resize(num_vectors, std::vector<int>(subspace_num));
+    }
+    if (rank == 0) {
+        std::cout << "Process " << rank << " is gathering results from all processes." << std::endl;
+    }
+    //MPI_Gather(local_index.data(), local_size * subspace_num, MPI_INT,
+               //all_indices.data(), local_size * subspace_num, MPI_INT, 0, MPI_COMM_WORLD);
+    if (rank == 0) {
+        std::cout << "All processes have completed their work and results have been gathered." << std::endl;
+        this->index = all_indices;
+    }
+
+    return (rank == 0) ? this->index : PQ_Index(); // 只有主进程返回完整索引
 }
 
 void PQ::save_index(const std::string &filename) {
@@ -351,6 +390,52 @@ std::vector<int> PQ::query_openmp(const SiftData<float> &querydata, int thread_n
     return result;
 }
 
+std::vector<int> PQ::query_mpi(const SiftData<float> &querydata) {
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    long long freq, head, tail;
+    QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
+    QueryPerformanceCounter((LARGE_INTEGER*)&head);
+
+    std::vector<int> local_result;
+    int local_size = querydata.get_num() / size;
+    int remainder = querydata.get_num() % size;
+
+    int local_start = rank * local_size;
+    int local_end = (rank == size - 1) ? querydata.get_num() : (rank + 1) * local_size;
+
+    for (int i = local_start; i < local_end; i++) {
+        local_result.push_back(asymmetric_query(querydata.data[i]));
+        if ((i - local_start) % 1000 == 0)
+            std::cout << "Rank " << rank << " queried " << (i - local_start) << " querypoint." << std::endl;
+    }
+
+    std::vector<int> result;
+    if (rank == 0) {
+        result.resize(querydata.get_num());
+    }
+
+    MPI_Gather(local_result.data(), local_result.size(), MPI_INT,
+               result.data(), local_size, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if (rank == 0 && remainder > 0) {
+        for (int i = size * local_size; i < querydata.get_num(); i++) {
+            result[i] = asymmetric_query(querydata.data[i]);
+            if ((i - size * local_size) % 1000 == 0)
+                std::cout << "Rank 0 queried remaining " << (i - size * local_size) << " querypoint." << std::endl;
+        }
+    }
+
+    QueryPerformanceCounter((LARGE_INTEGER*)&tail);
+    if (rank == 0) {
+        std::cout << "Query time: " << (tail - head) * 1000.0 / freq << "ms" << std::endl;
+    }
+
+    return result;
+}
+
 std::vector<int> PQ::query(const SiftData<float> &querydata) {
     long long freq, head, tail;
     QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
@@ -433,7 +518,6 @@ PQ_Index PQ::buildIndex_pthread(const SiftData<float>& data, int thread_num) {
 
 PQ_Index PQ::buildIndex_openmp(const SiftData<float>& data, int thread_num) {
     int num_vectors = data.get_num();
-    PQ_Index index(num_vectors, std::vector<int>(subspace_num));
 
     // 设置线程数
     omp_set_num_threads(thread_num);  // 你可以根据需要调整这个数字
@@ -441,7 +525,7 @@ PQ_Index PQ::buildIndex_openmp(const SiftData<float>& data, int thread_num) {
     // OpenMP 并行循环
     #pragma omp parallel for
     for (int i = 0; i < num_vectors; i++) {
-        index[i] = quantize_openmp(data.data[i]);
+        this->index[i] = quantize_openmp(data.data[i]);
     }
 
     return index;

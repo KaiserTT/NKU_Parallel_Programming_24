@@ -11,6 +11,7 @@
 #include <immintrin.h>
 #include <omp.h>
 #include <pthread.h>
+#include <mpi.h>
 
 // 从数据集中随机选择 k 个点作为初始聚类中心
 void KMEANS::initializeCentroids(const std::vector<std::vector<float>> &data) {
@@ -451,4 +452,131 @@ void* update_centroids_avx2(void* arg) {
     pthread_mutex_destroy(&mutex);
     // std::cout << "K-means fit finished." << std::endl;
     return centroids;
+}
+
+std::vector<std::vector<float>> KMEANS::fit_mpi(const std::vector<std::vector<float>>& data) {
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int n = data.size();
+    int local_n = n / size;
+    int dim = data[0].size();
+
+    std::cout << "Process " << rank << ": Starting fit_mpi with local data size " << local_n << std::endl;
+
+    // 手动打包数据
+    std::vector<float> flatten_data(n * dim);
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < dim; j++) {
+            flatten_data[i * dim + j] = data[i][j];
+        }
+    }
+
+    std::vector<float> local_flatten_data(local_n * dim);
+    MPI_Scatter(flatten_data.data(), local_n * dim, MPI_FLOAT,
+                local_flatten_data.data(), local_n * dim, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    // 解包到 local_data
+    std::vector<std::vector<float>> local_data(local_n, std::vector<float>(dim));
+    for (int i = 0; i < local_n; i++) {
+        for (int j = 0; j < dim; j++) {
+            local_data[i][j] = local_flatten_data[i * dim + j];
+        }
+    }
+
+    bool converged = false;
+    std::vector<int> labels(n);
+    std::vector<int> local_labels(local_n);
+
+    std::vector<float> flatten_centroids(k * dim);
+    if (rank == 0) {
+        this->initializeCentroids(data);
+        // 打包 centroids
+        for (int i = 0; i < k; i++) {
+            for (int j = 0; j < dim; j++) {
+                flatten_centroids[i * dim + j] = centroids[i][j];
+            }
+        }
+    }
+    MPI_Bcast(flatten_centroids.data(), k * dim, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    // 解包 centroids
+    for (int i = 0; i < k; i++) {
+        for (int j = 0; j < dim; j++) {
+            centroids[i][j] = flatten_centroids[i * dim + j];
+        }
+    }
+
+    for (int it = 0; it < this->max_iter && !converged; it++) {
+        std::cout << "Process " << rank << ": Iteration " << it << std::endl;
+        for (int i = 0; i < local_n; i++) {
+            double min_dist = std::numeric_limits<double>::max();
+            for (int j = 0; j < k; j++) {
+                double dist = distance(local_data[i], centroids[j]);
+                if (dist < min_dist) {
+                    min_dist = dist;
+                    local_labels[i] = j;
+                }
+            }
+        }
+
+        MPI_Allgather(local_labels.data(), local_n, MPI_INT,
+                      labels.data(), local_n, MPI_INT, MPI_COMM_WORLD);
+
+        bool changed = false;
+        for (int i = 0; i < n; i++) {
+            if (labels[i] != local_labels[i]) {
+                changed = true;
+                break;
+            }
+        }
+        MPI_Allreduce(&changed, &converged, 1, MPI_C_BOOL, MPI_LOR, MPI_COMM_WORLD);
+        converged = !converged;
+
+        if (converged) break;
+
+        std::vector<std::vector<float>> local_sum(k, std::vector<float>(dim, 0.0));
+        std::vector<int> local_count(k, 0);
+        for (int i = 0; i < local_n; i++) {
+            local_count[local_labels[i]]++;
+            for (int j = 0; j < dim; j++) {
+                local_sum[local_labels[i]][j] += local_data[i][j];
+            }
+        }
+
+        std::vector<float> flatten_sum(k * dim);
+        // 打包 local_sum
+        for (int i = 0; i < k; i++) {
+            for (int j = 0; j < dim; j++) {
+                flatten_sum[i * dim + j] = local_sum[i][j];
+            }
+        }
+
+        std::vector<float> sum_result(k * dim);
+        MPI_Allreduce(flatten_sum.data(), sum_result.data(), k * dim, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+
+        std::vector<std::vector<float>> sum(k, std::vector<float>(dim));
+        // 解包 sum_result
+        for (int i = 0; i < k; i++) {
+            for (int j = 0; j < dim; j++) {
+                sum[i][j] = sum_result[i * dim + j];
+            }
+        }
+
+        std::vector<int> count(k);
+        MPI_Allreduce(local_count.data(), count.data(), k, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
+        for (int i = 0; i < k; i++) {
+            if (count[i] > 0) {
+                for (int j = 0; j < dim; j++) {
+                    centroids[i][j] = sum[i][j] / count[i];
+                }
+            }
+        }
+    }
+
+    std::cout << "Process " << rank << ": Finished fit_mpi" << std::endl;
+
+    return this->centroids;
 }

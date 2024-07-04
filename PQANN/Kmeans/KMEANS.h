@@ -1,10 +1,6 @@
 //
 // Created by Kaiser Tan on 2024/4/21.
 //
-
-#ifndef PQANN_KMEANS_H
-#define PQANN_KMEANS_H
-
 #include <vector>
 #include <pthread.h>
 #include <stdexcept>
@@ -33,6 +29,8 @@ public:
 
     std::vector<std::vector<float>> fit_pthread(const std::vector<std::vector<float>>& data, int thread_num);
 
+    std::vector<std::vector<float>> fit_mpi(const std::vector<std::vector<float>>& data);
+
     void test() {
         for (int i = 0; i < 10; i++) {
             for (int j = 0; j < 10; j++) {
@@ -49,6 +47,3 @@ private:
     pthread_mutex_t mutex;
 
 };
-
-
-#endif //PQANN_KMEANS_H
